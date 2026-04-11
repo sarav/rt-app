@@ -409,6 +409,121 @@ static void memload(unsigned long count, struct _rtapp_iomem_buf *iomem)
 	}
 }
 
+static void memread(unsigned long count, struct _rtapp_iomem_buf *iomem)
+{
+	volatile char *p = (volatile char *)iomem->ptr;
+	unsigned long buf_size = iomem->size;
+	unsigned long passes = count / buf_size;
+	unsigned long remainder = count % buf_size;
+	unsigned long i, j;
+	char sink = 0;
+
+	for (i = 0; i < passes; i++)
+		for (j = 0; j < buf_size; j++)
+			sink += p[j];
+
+	for (j = 0; j < remainder; j++)
+		sink += p[j];
+
+	/* Prevent compiler from optimizing away the reads */
+	(void)sink;
+}
+
+static void memwrite(unsigned long count, struct _rtapp_iomem_buf *iomem)
+{
+	volatile char *p = (volatile char *)iomem->ptr;
+	unsigned long buf_size = iomem->size;
+	unsigned long passes = count / buf_size;
+	unsigned long remainder = count % buf_size;
+	unsigned long i, j;
+
+	for (i = 0; i < passes; i++)
+		for (j = 0; j < buf_size; j++)
+			p[j] = (char)j;
+
+	for (j = 0; j < remainder; j++)
+		p[j] = (char)j;
+}
+
+/*
+ * Bit-reverse an integer across nbits.
+ * E.g., bitreverse(1, 3) = 4 (001 -> 100)
+ */
+static inline unsigned int bitreverse(unsigned int val, int nbits)
+{
+	unsigned int result = 0;
+	int j;
+
+	for (j = 0; j < nbits; j++)
+		if (val & (1u << j))
+			result |= (1u << (nbits - j - 1));
+
+	return result;
+}
+
+/*
+ * Initialize a pointer chain for memory chase workload.
+ * Places one pointer per stride position in the buffer.
+ * random=1: bit-reversed order to defeat hardware prefetchers.
+ * random=0: sequential stride.
+ */
+static void memchase_init(struct _rtapp_mem_chase_buf *chase)
+{
+	size_t stride = chase->stride;
+	size_t npos = chase->size / stride;
+	int nbits;
+	size_t i;
+	char *base;
+
+	/* Round down to power of 2 for bit-reversal */
+	for (nbits = 0; (1u << (nbits + 1)) <= npos; nbits++)
+		;
+	npos = 1u << nbits;
+
+	if (npos < 2) {
+		log_error("mem_chase buffer too small (need at least 2 * stride)");
+		chase->base = NULL;
+		return;
+	}
+
+	base = malloc(npos * stride);
+	if (!base) {
+		log_error("Failed to allocate mem_chase buffer (%zu bytes)", npos * stride);
+		chase->base = NULL;
+		return;
+	}
+	chase->base = base;
+
+	if (chase->random) {
+		/* Bit-reversed pointer chain */
+		for (i = 0; i < npos; i++) {
+			size_t src_off = (size_t)bitreverse(i, nbits) * stride;
+			size_t dst_off = (size_t)bitreverse((i + 1) % npos, nbits) * stride;
+			*(char **)(base + src_off) = base + dst_off;
+		}
+	} else {
+		/* Sequential pointer chain */
+		for (i = 0; i < npos - 1; i++)
+			*(char **)(base + i * stride) = base + (i + 1) * stride;
+		*(char **)(base + (npos - 1) * stride) = base;
+	}
+}
+
+static void memchase_run(unsigned long count, struct _rtapp_mem_chase_buf *chase)
+{
+	char **p = (char **)chase->base;
+	unsigned long i;
+
+	if (!p)
+		return;
+
+	for (i = 0; i < count; i++)
+		p = (char **)*p;
+
+	/* Prevent compiler from optimizing away the chases */
+	*(volatile char **)&chase->base = (char *)p;
+}
+
 static int run_event(event_data_t *event, int dry_run,
 		unsigned long *perf, thread_data_t *tdata,
 		struct timespec *t_first, log_data_t *ldata)
@@ -566,6 +681,24 @@ static int run_event(event_data_t *event, int dry_run,
 		{
 			log_debug("mem %d", event->count);
 			memload(event->count, &rdata->res.buf);
+		}
+		break;
+	case rtapp_mem_write:
+		{
+			log_debug("mem_write %d", event->count);
+			memwrite(event->count, &rdata->res.buf);
+		}
+		break;
+	case rtapp_mem_read:
+		{
+			log_debug("mem_read %d", event->count);
+			memread(event->count, &rdata->res.buf);
+		}
+		break;
+	case rtapp_mem_chase:
+		{
+			log_debug("mem_chase %d", event->count);
+			memchase_run(event->count, &rdata->res.chase);
 		}
 		break;
 	case rtapp_iorun:
@@ -1614,6 +1747,13 @@ int main(int argc, char* argv[])
 
 	initialize_cgroups();
 	add_cgroups();
+
+	/* Initialize mem_chase pointer chains for all resources */
+	for (i = 0; i < opts.resources->nresources; i++) {
+		rtapp_resource_t *res = &opts.resources->resources[i];
+		if (res->type == rtapp_mem_chase && res->res.chase.base == NULL)
+			memchase_init(&res->res.chase);
+	}
 
 	/* Take the beginning time for everything */
 	clock_gettime(CLOCK_MONOTONIC, &t_start);

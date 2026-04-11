@@ -230,6 +230,28 @@ static void init_membuf_resource(rtapp_resource_t *data, const rtapp_options_t *
 	data->res.buf.size = opts->mem_buffer_size;
 }
 
+static void init_membuf_resource_sized(rtapp_resource_t *data, int size)
+{
+	log_info(PIN3 "Init: %s membuf (size %d)", data->name, size);
+
+	data->res.buf.ptr = malloc(size);
+	data->res.buf.size = size;
+	if (data->res.buf.ptr)
+		memset(data->res.buf.ptr, 0xAA, size);
+}
+
+static void init_memchase_resource(rtapp_resource_t *data, int size, int stride, int random)
+{
+	log_info(PIN3 "Init: %s mem_chase (size %d, stride %d, %s)", data->name,
+		 size, stride, random ? "random" : "sequential");
+
+	data->res.chase.size = size;
+	data->res.chase.stride = stride;
+	data->res.chase.random = random;
+	data->res.chase.base = NULL;
+	/* Chain is initialized by memchase_init() called from rt-app.c */
+}
+
 static void init_iodev_resource(rtapp_resource_t *data, const rtapp_options_t *opts)
 {
 	log_info(PIN3 "Init: %s io device", data->name);
@@ -281,7 +303,12 @@ init_resource_data(const char *name, int type, rtapp_resources_t *resources_tabl
 			init_cond_resource(data, opts);
 			break;
 		case rtapp_mem:
+		case rtapp_mem_write:
+		case rtapp_mem_read:
 			init_membuf_resource(data, opts);
+			break;
+		case rtapp_mem_chase:
+			/* Initialized later with size/pattern from JSON */
 			break;
 		case rtapp_iorun:
 			init_iodev_resource(data, opts);
@@ -424,7 +451,7 @@ parse_task_event_data(char *name, struct json_object *obj,
 {
 	rtapp_resources_t **resources_table = tdata->global_resources;
 	rtapp_resource_t *rdata, *ddata;
-	char unique_name[22];
+	char unique_name[RTAPP_EVENT_NAME_LENGTH + sizeof(long) * 2 + 1];
 	const char *ref;
 	char *tmp;
 	long tag = (long)tdata;
@@ -447,6 +474,60 @@ parse_task_event_data(char *name, struct json_object *obj,
 
 		log_info(PIN2 "type %d duration %d", data->type, data->duration);
 		strncpy(data->name, name, sizeof(data->name)-1);
+		return;
+	}
+
+	if (!strncmp(name, "memrun", strlen("memrun"))) {
+		if (!json_object_is_type(obj, json_type_object))
+			goto unknown_event;
+
+		ref = create_unique_name(unique_name, sizeof(unique_name), name, tag);
+
+		char *mem_type = get_string_value_from(obj, "type", FALSE, NULL);
+		int mem_size = get_int_value_from(obj, "size", FALSE, 0);
+		int mem_count = get_int_value_from(obj, "count", FALSE, 0);
+
+		if (!strcmp(mem_type, "chase")) {
+			char *pattern = get_string_value_from(obj, "pattern", TRUE, "random");
+			int is_random = strcmp(pattern, "sequential") != 0;
+			int stride = get_int_value_from(obj, "stride", TRUE, 64);
+
+			i = get_resource_index(ref, rtapp_mem_chase, resources_table, opts);
+			data->res = i;
+
+			rtapp_resource_t *mdata = &((*resources_table)->resources[i]);
+			init_memchase_resource(mdata, mem_size, stride, is_random);
+
+			data->count = mem_count;
+			data->type = rtapp_mem_chase;
+			free(pattern);
+		} else if (!strcmp(mem_type, "read")) {
+			i = get_resource_index(ref, rtapp_mem_read, resources_table, opts);
+			data->res = i;
+
+			rtapp_resource_t *mdata = &((*resources_table)->resources[i]);
+			init_membuf_resource_sized(mdata, mem_size);
+
+			data->count = mem_count;
+			data->type = rtapp_mem_read;
+		} else if (!strcmp(mem_type, "write")) {
+			i = get_resource_index(ref, rtapp_mem_write, resources_table, opts);
+			data->res = i;
+
+			rtapp_resource_t *mdata = &((*resources_table)->resources[i]);
+			init_membuf_resource_sized(mdata, mem_size);
+
+			data->count = mem_count;
+			data->type = rtapp_mem_write;
+		} else {
+			log_critical(PIN2 "Unknown memrun type: %s", mem_type);
+			free(mem_type);
+			goto unknown_event;
+		}
+
+		free(mem_type);
+		log_info(PIN2 "type %d count %d", data->type, data->count);
+		strncpy(data->name, unique_name, sizeof(data->name)-1);
 		return;
 	}
 
@@ -725,6 +806,7 @@ static char *events[] = {
 	"timer",
 	"suspend",
 	"resume",
+	"memrun",
 	"mem",
 	"iorun",
 	"yield",
